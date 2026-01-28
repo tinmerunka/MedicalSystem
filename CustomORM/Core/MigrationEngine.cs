@@ -3,18 +3,20 @@ using Npgsql;
 
 namespace CustomORM.Core
 {
-    /// Automatski kreira tablice u bazi na temelju entitetskih klasa
-    /// Ovo je pojednostavljena verzija EF migracija
+    /// Upravlja migracijama baze podataka koristeći snapshot pristup
+    /// Sprema stanje sheme u JSON datoteku i uspoređuje promjene
     public class MigrationEngine
     {
         private readonly string _connectionString;
+        private readonly string _snapshotPath;
 
-        public MigrationEngine(string connectionString)
+        public MigrationEngine(string connectionString, string? snapshotPath = null)
         {
             _connectionString = connectionString;
+            _snapshotPath = snapshotPath ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Migrations", "snapshot.json");
         }
 
-        /// Kreira sve tablice za dani DbContext ako ne postoje
+        /// Izvršava migracije - uspoređuje snapshot s trenutnim entitetima
         public void MigrateAll<TContext>() where TContext : CustomDbContext
         {
             var contextType = typeof(TContext);
@@ -22,30 +24,138 @@ namespace CustomORM.Core
 
             Console.WriteLine("=== MIGRATION ENGINE ===\n");
 
+            // 1. Učitaj stari snapshot (ako postoji)
+            var oldSnapshot = SchemaSnapshot.LoadFromFile(_snapshotPath);
+            if (oldSnapshot != null)
+            {
+                Console.WriteLine($"[INFO] Loaded existing snapshot (version {oldSnapshot.Version}, created {oldSnapshot.CreatedAt:dd.MM.yyyy HH:mm})");
+            }
+            else
+            {
+                Console.WriteLine("[INFO] No existing snapshot found - creating new schema");
+            }
+
+            // 2. Kreiraj novi snapshot iz trenutnih entiteta
+            var newSnapshot = SchemaDiffer.CreateSnapshotFromEntities(entityTypes);
+            newSnapshot.Version = (oldSnapshot?.Version ?? 0) + 1;
+
+            // 3. Usporedi i dohvati promjene
+            var changes = SchemaDiffer.Compare(oldSnapshot, newSnapshot);
+
+            if (!changes.Any())
+            {
+                Console.WriteLine("[INFO] No changes detected - database is up to date");
+                Console.WriteLine("\n=== MIGRATION COMPLETE ===\n");
+                return;
+            }
+
+            // 4. Prikaži i izvrši promjene
+            Console.WriteLine($"\n[INFO] Found {changes.Count} change(s):\n");
+
             using var connection = new NpgsqlConnection(_connectionString);
             connection.Open();
 
-            foreach (var entityType in entityTypes)
+            foreach (var change in changes)
             {
-                var tableName = EntityMapper.GetTableName(entityType);
+                Console.WriteLine($"  [{change.Type}] {GetChangeDescription(change)}");
 
-                if (TableExists(tableName, connection))
+                try
                 {
-                    Console.WriteLine($"[SKIP] Table \"{tableName}\" already exists.");
+                    ExecuteSql(change.Sql, connection);
+                    Console.WriteLine($"    ✓ Success");
                 }
-                else
+                catch (Exception ex)
                 {
-                    Console.WriteLine($"[CREATE] Creating table \"{tableName}\"...");
-                    CreateTable(entityType, connection);
-                    Console.WriteLine($"[OK] Table \"{tableName}\" created successfully.");
+                    Console.WriteLine($"    ✗ Error: {ex.Message}");
+                    throw;
                 }
             }
+
+            // 5. Spremi novi snapshot
+            newSnapshot.SaveToFile(_snapshotPath);
+            Console.WriteLine($"\n[INFO] Snapshot saved to: {_snapshotPath}");
 
             Console.WriteLine("\n=== MIGRATION COMPLETE ===\n");
         }
 
+        /// Prikazuje plan migracije bez izvršavanja
+        public void ShowMigrationPlan<TContext>() where TContext : CustomDbContext
+        {
+            var contextType = typeof(TContext);
+            var entityTypes = GetEntityTypes(contextType);
+
+            Console.WriteLine("=== MIGRATION PLAN ===\n");
+
+            var oldSnapshot = SchemaSnapshot.LoadFromFile(_snapshotPath);
+            var newSnapshot = SchemaDiffer.CreateSnapshotFromEntities(entityTypes);
+
+            var changes = SchemaDiffer.Compare(oldSnapshot, newSnapshot);
+
+            if (!changes.Any())
+            {
+                Console.WriteLine("No changes detected.\n");
+                return;
+            }
+
+            Console.WriteLine($"Found {changes.Count} change(s):\n");
+
+            foreach (var change in changes)
+            {
+                Console.WriteLine($"[{change.Type}] {GetChangeDescription(change)}");
+                Console.WriteLine($"SQL: {change.Sql}");
+                Console.WriteLine();
+            }
+        }
+
+        /// Resetira bazu i snapshot
+        public void Reset<TContext>() where TContext : CustomDbContext
+        {
+            // Obriši snapshot
+            if (File.Exists(_snapshotPath))
+            {
+                File.Delete(_snapshotPath);
+                Console.WriteLine("[INFO] Deleted existing snapshot");
+            }
+
+            // Obriši sve tablice
+            var contextType = typeof(TContext);
+            var entityTypes = GetEntityTypes(contextType);
+
+            using var connection = new NpgsqlConnection(_connectionString);
+            connection.Open();
+
+            foreach (var entityType in entityTypes.AsEnumerable().Reverse())
+            {
+                var tableName = EntityMapper.GetTableName(entityType);
+                var sql = $"DROP TABLE IF EXISTS \"{tableName}\" CASCADE;";
+
+                try
+                {
+                    ExecuteSql(sql, connection);
+                    Console.WriteLine($"[DROP] Dropped table \"{tableName}\"");
+                }
+                catch { }
+            }
+
+            // Pokreni migracije iznova
+            MigrateAll<TContext>();
+        }
+
+        /// Vraća opis promjene za prikaz
+        private string GetChangeDescription(SchemaChange change)
+        {
+            return change.Type switch
+            {
+                ChangeType.CreateTable => $"Create table \"{change.TableName}\"",
+                ChangeType.DropTable => $"Drop table \"{change.TableName}\"",
+                ChangeType.AddColumn => $"Add column \"{change.ColumnName}\" to \"{change.TableName}\"",
+                ChangeType.DropColumn => $"Drop column \"{change.ColumnName}\" from \"{change.TableName}\"",
+                ChangeType.AlterColumn => $"Alter column \"{change.ColumnName}\" in \"{change.TableName}\"",
+                _ => change.ToString() ?? ""
+            };
+        }
+
         /// Dohvaća sve tipove entiteta iz DbContext-a
-        /// Gleda DbSet<T> propertyje i izvlači T
         private List<Type> GetEntityTypes(Type contextType)
         {
             var entityTypes = new List<Type>();
@@ -67,91 +177,11 @@ namespace CustomORM.Core
             return entityTypes;
         }
 
-        /// Provjerava postoji li tablica u bazi
-        private bool TableExists(string tableName, NpgsqlConnection connection)
+        /// Izvršava SQL naredbu
+        private void ExecuteSql(string sql, NpgsqlConnection connection)
         {
-            var sql = @"
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_schema = 'public' 
-                    AND table_name = @tableName
-                );";
-
-            using var command = new NpgsqlCommand(sql, connection);
-            command.Parameters.AddWithValue("@tableName", tableName);
-
-            return (bool)command.ExecuteScalar()!;
-        }
-
-        /// Kreira tablicu za dani tip entiteta
-        private void CreateTable(Type entityType, NpgsqlConnection connection)
-        {
-            var sql = QueryBuilder.BuildCreateTable(entityType);
-
-            Console.WriteLine($"    SQL: {sql.Replace("\n", " ").Substring(0, Math.Min(80, sql.Length))}...");
-
             using var command = new NpgsqlCommand(sql, connection);
             command.ExecuteNonQuery();
-        }
-
-        /// Briše sve tablice za dani DbContext
-        public void DropAll<TContext>() where TContext : CustomDbContext
-        {
-            var contextType = typeof(TContext);
-            var entityTypes = GetEntityTypes(contextType);
-
-            Console.WriteLine("=== DROPPING ALL TABLES ===\n");
-
-            using var connection = new NpgsqlConnection(_connectionString);
-            connection.Open();
-
-            // Obrnuti redoslijed zbog foreign key-eva
-            entityTypes.Reverse();
-
-            foreach (var entityType in entityTypes)
-            {
-                var tableName = EntityMapper.GetTableName(entityType);
-
-                if (TableExists(tableName, connection))
-                {
-                    Console.WriteLine($"[DROP] Dropping table \"{tableName}\"...");
-                    var sql = QueryBuilder.BuildDropTable(entityType);
-
-                    using var command = new NpgsqlCommand(sql, connection);
-                    command.ExecuteNonQuery();
-
-                    Console.WriteLine($"[OK] Table \"{tableName}\" dropped.");
-                }
-            }
-
-            Console.WriteLine("\n=== DROP COMPLETE ===\n");
-        }
-
-        /// Prikazuje SQL koji bi se izvršio za kreiranje tablica (bez izvršavanja).
-        /// Korisno za debug i pregled
-        public void ShowMigrationPlan<TContext>() where TContext : CustomDbContext
-        {
-            var contextType = typeof(TContext);
-            var entityTypes = GetEntityTypes(contextType);
-
-            Console.WriteLine("=== MIGRATION PLAN ===\n");
-
-            foreach (var entityType in entityTypes)
-            {
-                var tableName = EntityMapper.GetTableName(entityType);
-                var sql = QueryBuilder.BuildCreateTable(entityType);
-
-                Console.WriteLine($"-- Table: {tableName}");
-                Console.WriteLine(sql);
-                Console.WriteLine();
-            }
-        }
-
-        /// Resetira bazu - briše sve tablice i kreira ih ponovo
-        public void Reset<TContext>() where TContext : CustomDbContext
-        {
-            DropAll<TContext>();
-            MigrateAll<TContext>();
         }
     }
 }

@@ -14,6 +14,9 @@ namespace MedicalSystem
             {
                 var migrator = new MigrationEngine(MedicalDbContext.GetConnectionString());
                 migrator.MigrateAll<MedicalDbContext>();
+                // Dodaj ovo:
+                Console.WriteLine("Press any key to continue...");
+                Console.ReadKey();
             }
             catch (Exception ex)
             {
