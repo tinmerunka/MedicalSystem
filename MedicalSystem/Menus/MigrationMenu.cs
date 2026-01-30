@@ -21,10 +21,9 @@ namespace MedicalSystem.Menus
                 Console.WriteLine($"Current database version: {currentVersion}\n");
 
                 Console.WriteLine("1. Show migration history");
-                Console.WriteLine("2. Show pending changes");
-                Console.WriteLine("3. Rollback last migration");
-                Console.WriteLine("4. Rollback to specific version");
-                Console.WriteLine("5. Reset database (DANGER!)");
+                Console.WriteLine("2. Rollback last migration");
+                Console.WriteLine("3. Rollback to specific version");
+                Console.WriteLine("4. Reset database (DANGER!)");
                 Console.WriteLine("0. Back");
                 Console.Write("\nSelect option: ");
 
@@ -34,15 +33,12 @@ namespace MedicalSystem.Menus
                         ShowHistory(migrator);
                         break;
                     case "2":
-                        ShowPlan(migrator);
-                        break;
-                    case "3":
                         RollbackLast(migrator);
                         break;
-                    case "4":
+                    case "3":
                         RollbackToVersion(migrator);
                         break;
-                    case "5":
+                    case "4":
                         ResetDatabase(migrator);
                         break;
                     case "0":
@@ -56,14 +52,6 @@ namespace MedicalSystem.Menus
         {
             Console.Clear();
             migrator.ShowHistory();
-            Console.WriteLine("Press any key to continue...");
-            Console.ReadKey();
-        }
-
-        private static void ShowPlan(MigrationEngine migrator)
-        {
-            Console.Clear();
-            migrator.ShowMigrationPlan<MedicalDbContext>();
             Console.WriteLine("Press any key to continue...");
             Console.ReadKey();
         }

@@ -31,8 +31,8 @@ namespace MedicalSystem.Entities
         [Column("PermanentAddress", IsNullable = false)]
         public string PermanentAddress { get; set; } = string.Empty;
 
-        //[Column("Age", IsNullable = true)]
-        //public int? Age { get; set; }
+        [Column("Age", IsNullable = true)]
+        public int? Age { get; set; }
 
         // Navigation properties
         public virtual ICollection<MedicalHistory> MedicalHistories { get; set; } = new List<MedicalHistory>();
