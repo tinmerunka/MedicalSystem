@@ -24,7 +24,6 @@
     /// Uspoređuje snapshot s trenutnim entitetima i generira promjene
     public static class SchemaDiffer
     {
-        /// <summary>
         /// Kreira snapshot trenutnog stanja entiteta (iz koda)
         public static SchemaSnapshot CreateSnapshotFromEntities(IEnumerable<Type> entityTypes)
         {
@@ -301,6 +300,53 @@
                 "TIMESTAMP" or "TIMESTAMPTZ" => "NOW()",
                 _ => "''"  // TEXT, VARCHAR, etc.
             };
+        }
+
+        /// <summary>
+        /// Generira SQL DOWN (obrnuti SQL) za danu promjenu.
+        /// </summary>
+        public static string GenerateSqlDown(SchemaChange change)
+        {
+            return change.Type switch
+            {
+                ChangeType.CreateTable => $"DROP TABLE IF EXISTS \"{change.TableName}\" CASCADE;",
+
+                ChangeType.DropTable => GenerateCreateTableSql(new TableSnapshot
+                {
+                    TableName = change.TableName,
+                    Columns = new List<ColumnSnapshot> { change.OldColumn! }
+                }),
+
+                ChangeType.AddColumn => $"ALTER TABLE \"{change.TableName}\" DROP COLUMN \"{change.ColumnName}\";",
+
+                ChangeType.DropColumn => GenerateAddColumnSql(change.TableName, change.OldColumn!),
+
+                ChangeType.AlterColumn => GenerateAlterColumnSql(change.TableName, change.NewColumn!, change.OldColumn!),
+
+                _ => ""
+            };
+        }
+
+        /// Generira SQL DOWN za listu promjena (obrnuti redoslijed)
+        public static string GenerateAllSqlDown(List<SchemaChange> changes)
+        {
+            var downStatements = changes
+                .AsEnumerable()
+                .Reverse()
+                .Select(c => GenerateSqlDown(c))
+                .Where(sql => !string.IsNullOrEmpty(sql));
+
+            return string.Join("\n", downStatements);
+        }
+
+        /// Generira SQL UP za listu promjena
+        public static string GenerateAllSqlUp(List<SchemaChange> changes)
+        {
+            var upStatements = changes
+                .Select(c => c.Sql)
+                .Where(sql => !string.IsNullOrEmpty(sql));
+
+            return string.Join("\n", upStatements);
         }
     }
 }

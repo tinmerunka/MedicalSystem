@@ -3,17 +3,17 @@ using Npgsql;
 
 namespace CustomORM.Core
 {
-    /// Upravlja migracijama baze podataka koristeći snapshot pristup
-    /// Sprema stanje sheme u JSON datoteku i uspoređuje promjene
+    /// Upravlja migracijama baze podataka
+    /// Podržava migrate up i rollback
     public class MigrationEngine
     {
         private readonly string _connectionString;
-        private readonly string _snapshotPath;
+        private readonly MigrationHistory _history;
 
-        public MigrationEngine(string connectionString, string? snapshotPath = null)
+        public MigrationEngine(string connectionString)
         {
             _connectionString = connectionString;
-            _snapshotPath = snapshotPath ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Migrations", "snapshot.json");
+            _history = new MigrationHistory(connectionString);
         }
 
         /// Izvršava migracije - uspoređuje snapshot s trenutnim entitetima
@@ -24,32 +24,29 @@ namespace CustomORM.Core
 
             Console.WriteLine("=== MIGRATION ENGINE ===\n");
 
-            // 1. Učitaj stari snapshot (ako postoji)
-            var oldSnapshot = SchemaSnapshot.LoadFromFile(_snapshotPath);
-            if (oldSnapshot != null)
-            {
-                Console.WriteLine($"[INFO] Loaded existing snapshot (version {oldSnapshot.Version}, created {oldSnapshot.CreatedAt:dd.MM.yyyy HH:mm})");
-            }
-            else
-            {
-                Console.WriteLine("[INFO] No existing snapshot found - creating new schema");
-            }
+            // 1. Dohvati trenutnu verziju i snapshot iz baze
+            var currentVersion = _history.GetCurrentVersion();
+            var oldSnapshot = _history.GetLatestSnapshot();
+
+            Console.WriteLine($"[INFO] Current database version: {currentVersion}");
 
             // 2. Kreiraj novi snapshot iz trenutnih entiteta
             var newSnapshot = SchemaDiffer.CreateSnapshotFromEntities(entityTypes);
-            newSnapshot.Version = (oldSnapshot?.Version ?? 0) + 1;
 
             // 3. Usporedi i dohvati promjene
             var changes = SchemaDiffer.Compare(oldSnapshot, newSnapshot);
 
             if (!changes.Any())
             {
-                Console.WriteLine("[INFO] No changes detected - database is up to date");
-                Console.WriteLine("\n=== MIGRATION COMPLETE ===\n");
+                Console.WriteLine("[INFO] No changes detected - database is up to date\n");
                 return;
             }
 
-            // 4. Prikaži i izvrši promjene
+            // 4. Generiraj SQL UP i DOWN
+            var sqlUp = SchemaDiffer.GenerateAllSqlUp(changes);
+            var sqlDown = SchemaDiffer.GenerateAllSqlDown(changes);
+
+            // 5. Prikaži promjene
             Console.WriteLine($"\n[INFO] Found {changes.Count} change(s):\n");
 
             using var connection = new NpgsqlConnection(_connectionString);
@@ -71,11 +68,120 @@ namespace CustomORM.Core
                 }
             }
 
-            // 5. Spremi novi snapshot
-            newSnapshot.SaveToFile(_snapshotPath);
-            Console.WriteLine($"\n[INFO] Snapshot saved to: {_snapshotPath}");
+            // 6. Spremi migraciju u history
+            var newVersion = currentVersion + 1;
+            var migrationName = GenerateMigrationName(changes);
 
-            Console.WriteLine("\n=== MIGRATION COMPLETE ===\n");
+            _history.AddMigration(newVersion, migrationName, newSnapshot, sqlUp, sqlDown);
+
+            Console.WriteLine($"\n[INFO] Migration v{newVersion} '{migrationName}' applied successfully");
+            Console.WriteLine($"[INFO] To rollback, use: Rollback<{contextType.Name}>()\n");
+        }
+
+        /// Rollback zadnje migracije
+        public void Rollback<TContext>() where TContext : CustomDbContext
+        {
+            var currentVersion = _history.GetCurrentVersion();
+
+            if (currentVersion == 0)
+            {
+                Console.WriteLine("[INFO] No migrations to rollback.\n");
+                return;
+            }
+
+            RollbackTo<TContext>(currentVersion - 1);
+        }
+
+        /// Rollback do određene verzije
+        public void RollbackTo<TContext>(int targetVersion) where TContext : CustomDbContext
+        {
+            var currentVersion = _history.GetCurrentVersion();
+
+            Console.WriteLine("=== MIGRATION ROLLBACK ===\n");
+            Console.WriteLine($"[INFO] Current version: {currentVersion}");
+            Console.WriteLine($"[INFO] Target version: {targetVersion}\n");
+
+            if (targetVersion >= currentVersion)
+            {
+                Console.WriteLine("[INFO] Target version must be less than current version.\n");
+                return;
+            }
+
+            if (targetVersion < 0)
+            {
+                Console.WriteLine("[INFO] Target version cannot be negative.\n");
+                return;
+            }
+
+            using var connection = new NpgsqlConnection(_connectionString);
+            connection.Open();
+
+            // Rollback od trenutne do target verzije (unatrag)
+            for (int version = currentVersion; version > targetVersion; version--)
+            {
+                var migration = _history.GetMigration(version);
+
+                if (migration == null)
+                {
+                    Console.WriteLine($"[ERROR] Migration v{version} not found!\n");
+                    return;
+                }
+
+                Console.WriteLine($"[ROLLBACK] v{version} '{migration.Name}'");
+
+                try
+                {
+                    // Izvrši SQL DOWN
+                    var downStatements = migration.SqlDown.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+
+                    foreach (var sql in downStatements)
+                    {
+                        if (!string.IsNullOrWhiteSpace(sql))
+                        {
+                            Console.WriteLine($"  Executing: {sql.Substring(0, Math.Min(60, sql.Length))}...");
+                            ExecuteSql(sql, connection);
+                        }
+                    }
+
+                    // Obriši migraciju iz historya
+                    _history.RemoveMigration(version);
+
+                    Console.WriteLine($"  ✓ Rolled back successfully\n");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"  ✗ Error: {ex.Message}\n");
+                    throw;
+                }
+            }
+
+            Console.WriteLine($"[INFO] Rollback complete. Current version: {targetVersion}\n");
+        }
+
+        /// Prikazuje povijest migracija
+        public void ShowHistory()
+        {
+            var migrations = _history.GetAllMigrations();
+            var currentVersion = _history.GetCurrentVersion();
+
+            Console.WriteLine("=== MIGRATION HISTORY ===\n");
+
+            if (!migrations.Any())
+            {
+                Console.WriteLine("No migrations applied yet.\n");
+                return;
+            }
+
+            Console.WriteLine($"Current version: {currentVersion}\n");
+
+            foreach (var m in migrations.OrderByDescending(x => x.Version))
+            {
+                var marker = m.Version == currentVersion ? " (current)" : "";
+                Console.WriteLine($"  [v{m.Version}] {m.Name}{marker}");
+                Console.WriteLine($"        Applied: {m.AppliedAt:dd.MM.yyyy HH:mm:ss}");
+            }
+
+            Console.WriteLine();
         }
 
         /// Prikazuje plan migracije bez izvršavanja
@@ -86,7 +192,7 @@ namespace CustomORM.Core
 
             Console.WriteLine("=== MIGRATION PLAN ===\n");
 
-            var oldSnapshot = SchemaSnapshot.LoadFromFile(_snapshotPath);
+            var oldSnapshot = _history.GetLatestSnapshot();
             var newSnapshot = SchemaDiffer.CreateSnapshotFromEntities(entityTypes);
 
             var changes = SchemaDiffer.Compare(oldSnapshot, newSnapshot);
@@ -102,29 +208,28 @@ namespace CustomORM.Core
             foreach (var change in changes)
             {
                 Console.WriteLine($"[{change.Type}] {GetChangeDescription(change)}");
-                Console.WriteLine($"SQL: {change.Sql}");
+                Console.WriteLine($"  UP:   {change.Sql}");
+                Console.WriteLine($"  DOWN: {SchemaDiffer.GenerateSqlDown(change)}");
                 Console.WriteLine();
             }
         }
 
-        /// Resetira bazu i snapshot
+        /// Resetira sve - briše tablice i history
         public void Reset<TContext>() where TContext : CustomDbContext
         {
-            // Obriši snapshot
-            if (File.Exists(_snapshotPath))
-            {
-                File.Delete(_snapshotPath);
-                Console.WriteLine("[INFO] Deleted existing snapshot");
-            }
+            Console.WriteLine("=== RESET DATABASE ===\n");
 
-            // Obriši sve tablice
             var contextType = typeof(TContext);
             var entityTypes = GetEntityTypes(contextType);
 
             using var connection = new NpgsqlConnection(_connectionString);
             connection.Open();
 
-            foreach (var entityType in entityTypes.AsEnumerable().Reverse())
+            // Obriši sve tablice (obrnutim redoslijedom)
+            var reversedTypes = entityTypes.ToList();
+            reversedTypes.Reverse();
+
+            foreach (var entityType in reversedTypes)
             {
                 var tableName = EntityMapper.GetTableName(entityType);
                 var sql = $"DROP TABLE IF EXISTS \"{tableName}\" CASCADE;";
@@ -137,11 +242,40 @@ namespace CustomORM.Core
                 catch { }
             }
 
-            // Pokreni migracije iznova
-            MigrateAll<TContext>();
+            // Očisti history
+            _history.ClearAll();
+            Console.WriteLine("[INFO] Cleared migration history");
+
+            Console.WriteLine("\n[INFO] Reset complete. Run MigrateAll() to recreate.\n");
         }
 
-        /// Vraća opis promjene za prikaz
+        /// Generira ime migracije na temelju promjena
+        private string GenerateMigrationName(List<SchemaChange> changes)
+        {
+            if (changes.Count == 0)
+                return "EmptyMigration";
+
+            var firstChange = changes.First();
+
+            return firstChange.Type switch
+            {
+                ChangeType.CreateTable when changes.All(c => c.Type == ChangeType.CreateTable)
+                    => "InitialCreate",
+                ChangeType.CreateTable
+                    => $"Create{firstChange.TableName}",
+                ChangeType.AddColumn
+                    => $"Add{firstChange.ColumnName}To{firstChange.TableName}",
+                ChangeType.DropColumn
+                    => $"Remove{firstChange.ColumnName}From{firstChange.TableName}",
+                ChangeType.AlterColumn
+                    => $"Alter{firstChange.ColumnName}In{firstChange.TableName}",
+                ChangeType.DropTable
+                    => $"Drop{firstChange.TableName}",
+                _ => $"Migration_{DateTime.UtcNow:yyyyMMddHHmmss}"
+            };
+        }
+
+        /// Vraća opis promjene
         private string GetChangeDescription(SchemaChange change)
         {
             return change.Type switch
@@ -155,7 +289,7 @@ namespace CustomORM.Core
             };
         }
 
-        /// Dohvaća sve tipove entiteta iz DbContext-a
+        /// Dohvaća tipove entiteta iz DbContext-a
         private List<Type> GetEntityTypes(Type contextType)
         {
             var entityTypes = new List<Type>();
@@ -177,7 +311,7 @@ namespace CustomORM.Core
             return entityTypes;
         }
 
-        /// Izvršava SQL naredbu
+        /// Izvršava SQL
         private void ExecuteSql(string sql, NpgsqlConnection connection)
         {
             using var command = new NpgsqlCommand(sql, connection);

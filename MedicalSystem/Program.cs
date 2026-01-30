@@ -50,6 +50,7 @@ namespace MedicalSystem
                 Console.WriteLine("4. Prescribed Medications");
                 Console.WriteLine("5. Specialist Examinations");
                 Console.WriteLine("6. View Doctors");
+                Console.WriteLine("7. Database Migrations");
                 Console.WriteLine("0. Exit");
                 Console.Write("\nSelect option: ");
 
@@ -61,6 +62,7 @@ namespace MedicalSystem
                     case "4": PrescribedMedicationMenu.Show(context); break;
                     case "5": SpecialistExaminationMenu.Show(context); break;
                     case "6": DoctorMenu.Show(context); break;
+                    case "7": MigrationMenu.Show(); break; 
                     case "0": running = false; break;
                 }
             }
